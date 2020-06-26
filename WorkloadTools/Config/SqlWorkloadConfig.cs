@@ -11,6 +11,7 @@ using DouglasCrockford.JsMin;
 using WorkloadTools.Listener.ExtendedEvents;
 using WorkloadTools.Consumer.Replay;
 using WorkloadTools.Consumer.Analysis;
+using WorkloadTools.Util;
 
 namespace WorkloadTools.Config
 {
@@ -28,6 +29,7 @@ namespace WorkloadTools.Config
         public static SqlWorkloadConfig LoadFromFile(string path)
         {
             JavaScriptSerializer ser = new JavaScriptSerializer(new SqlWorkloadConfigTypeResolver());
+            ser.RegisterConverters(new JavaScriptConverter[] { new ModelConverter() });
             using (StreamReader r = new StreamReader(path))
             {
                 string json = r.ReadToEnd();
@@ -87,7 +89,7 @@ namespace WorkloadTools.Config
                 }
             });
 
-            x.Controller.Consumers.Add(new AnalysisConsumer()
+            x.Controller.Consumers.Add(new ReplayConsumer()
             {
                 ConnectionInfo = new SqlConnectionInfo()
                 {
@@ -97,7 +99,11 @@ namespace WorkloadTools.Config
                     DatabaseName = "RTR",
                     SchemaName = "baseline"
                 },
-                UploadIntervalSeconds = 60
+                DatabaseMap = new Dictionary<string, string>()
+                {
+                    { "DatabaseA", "DatabaseB" },
+                    { "DatabaseC", "DatabaseD" }
+                }
             });
 
             string s = ser.Serialize(x);

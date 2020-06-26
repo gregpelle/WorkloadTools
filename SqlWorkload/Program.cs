@@ -72,6 +72,19 @@ namespace SqlWorkload
                         pathToLog = Path.Combine(Environment.CurrentDirectory, pathToLog);
                     }
                     target.FileName = pathToLog;
+
+                    if(options.LogLevel != null)
+                    {
+                        foreach(var rule in LogManager.Configuration.LoggingRules)
+                        {
+                            foreach (var level in LogLevel.AllLoggingLevels)
+                            {
+                                rule.DisableLoggingForLevel(level);
+                            }
+                            rule.EnableLoggingForLevels(LogLevel.FromString(options.LogLevel),LogLevel.Fatal);
+                        }
+                    }
+
                     LogManager.ReconfigExistingLoggers();
                 }
             }
@@ -85,13 +98,15 @@ namespace SqlWorkload
             Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs e) {
                 e.Cancel = true;
                 logger.Info("Received shutdown signal...");
-                source.CancelAfter(TimeSpan.FromSeconds(10)); // give a 10 seconds cancellation grace period 
+                source.CancelAfter(TimeSpan.FromSeconds(100)); // give a 100 seconds cancellation grace period 
                 config.Controller.Stop();
             };
 
             Task t = processController(config.Controller);
             t.Wait();
             logger.Info("Controller stopped.");
+            config.Controller.Dispose();
+            logger.Info("Controller disposed.");
         }
 
 
@@ -105,7 +120,6 @@ namespace SqlWorkload
             finally
             {
                 Console.WriteLine("Caught unhandled exception...");
-
             }
         }
 
@@ -139,6 +153,9 @@ namespace SqlWorkload
 
         [Option('L', "Log", HelpText = "Log file")]
         public string LogFile { get; set; }
+
+        [Option('E', "LogLevel", HelpText = "Log level")]
+        public string LogLevel { get; set; }
 
         [ParserState]
         public IParserState LastParserState { get; set; }

@@ -1,4 +1,4 @@
-﻿using NLog;
+using NLog;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -14,39 +14,82 @@ namespace WorkloadTools.Consumer.Replay
     {
         private static Logger logger = LogManager.GetCurrentClassLogger();
 
-        private static readonly int SEMAPHORE_LIMIT = Properties.Settings.Default.ReplayConsumer_SEMAPHORE_LIMIT;
-        private static readonly int WORKER_EXPIRY_TIMEOUT_SECONDS = Properties.Settings.Default.ReplayConsumer_WORKER_EXPIRY_TIMEOUT_SECONDS;
-        private static readonly Semaphore WorkLimiter = new Semaphore(SEMAPHORE_LIMIT, SEMAPHORE_LIMIT);
+        private SpinWait spin = new SpinWait();
+        public int ThreadLimit = 32;
+        public int InactiveWorkerTerminationTimeoutSeconds = 300;
+        private Semaphore WorkLimiter;
 
 		public bool DisplayWorkerStats { get; set; } = true;
 		public bool ConsumeResults { get; set; } = true;
 		public int QueryTimeoutSeconds { get; set; } = 30;
-		public int WorkerStatsCommandCount { get; set; } = 200;
+		public int WorkerStatsCommandCount { get; set; } = 1000;
 		public bool MimicApplicationName { get; set; } = false;
 
+        public Dictionary<string, string> DatabaseMap { get; set; } = new Dictionary<string, string>();
+
 		public SqlConnectionInfo ConnectionInfo { get; set; }
-        public SynchronizationModeEnum SynchronizationMode { get; set; } = SynchronizationModeEnum.None;
+        public SynchronizationModeEnum SynchronizationMode { get; set; } = SynchronizationModeEnum.WorkerTask;
 
         private ConcurrentDictionary<int, ReplayWorker> ReplayWorkers = new ConcurrentDictionary<int, ReplayWorker>();
         private Thread runner;
         private Thread sweeper;
 
+        private long eventCount;
+        private DateTime startTime = DateTime.MinValue;
+
+        // holds the total number of events to replay
+        // only available when reading from a file
+        // for realtime replays this is not available
+        private long totalEventCount = 0;
+
         public enum SynchronizationModeEnum
         {
             ThreadPools,
             Tasks,
-            None
+            WorkerTask,
+            Serial
         }
 
-
+        public ReplayConsumer()
+        {
+            WorkLimiter = new Semaphore(ThreadLimit, ThreadLimit);
+        }
 
         public override void ConsumeBuffered(WorkloadEvent evnt)
         {
+            if(evnt is MessageWorkloadEvent)
+            {
+                MessageWorkloadEvent msgEvent = evnt as MessageWorkloadEvent;
+                if (msgEvent.MsgType == MessageWorkloadEvent.MessageType.TotalEvents)
+                {
+                    try
+                    {
+                        totalEventCount = (long)msgEvent.Value;
+                    }
+                    catch (Exception e)
+                    {
+                        logger.Error($"Unable to set the total number of events: {e.Message}");
+                    }
+                }
+            }
+
             if (!(evnt is ExecutionWorkloadEvent))
                 return;
 
             if (evnt.Type != WorkloadEvent.EventType.RPCCompleted && evnt.Type != WorkloadEvent.EventType.BatchCompleted)
                 return;
+
+            eventCount++;
+            if ((eventCount > 0) && (eventCount % WorkerStatsCommandCount == 0))
+            {
+                string percentInfo = (totalEventCount > 0) ? "( " + ((eventCount * 100) / totalEventCount).ToString() + "% )" : "";
+                logger.Info($"{eventCount} events queued for replay {percentInfo}");
+            }
+
+            if (startTime == DateTime.MinValue)
+            {
+                startTime = DateTime.Now;
+            }
 
             ExecutionWorkloadEvent evt = (ExecutionWorkloadEvent)evnt;
 
@@ -54,7 +97,9 @@ namespace WorkloadTools.Consumer.Replay
             {
                 CommandText = evt.Text,
                 Database = evt.DatabaseName,
-                ApplicationName = evt.ApplicationName
+                ApplicationName = evt.ApplicationName,
+                ReplayOffset = evt.ReplayOffset,
+                EventSequence = evt.EventSequence
             };
 
             int session_id = -1;
@@ -63,6 +108,11 @@ namespace WorkloadTools.Consumer.Replay
             ReplayWorker rw = null;
             if (ReplayWorkers.TryGetValue(session_id, out rw))
             {
+                // Ensure that the buffer does not get too big
+                while (rw.QueueLength >= (BufferSize * .9))
+                {
+                    spin.SpinOnce();
+                }
                 rw.AppendCommand(command);
             }
             else
@@ -77,12 +127,14 @@ namespace WorkloadTools.Consumer.Replay
 					ConsumeResults = this.ConsumeResults,
 					QueryTimeoutSeconds = this.QueryTimeoutSeconds,
 					WorkerStatsCommandCount = this.WorkerStatsCommandCount,
-					MimicApplicationName = this.MimicApplicationName
+					MimicApplicationName = this.MimicApplicationName,
+                    DatabaseMap = this.DatabaseMap,
+                    StartTime = startTime
 				};
                 ReplayWorkers.TryAdd(session_id, rw);
                 rw.AppendCommand(command);
 
-                logger.Info(String.Format("Worker [{0}] - Starting", session_id));
+                logger.Info($"Worker [{session_id}] - Starting");
             }
 
             if(runner == null)
@@ -97,7 +149,7 @@ namespace WorkloadTools.Consumer.Replay
                                     }
                                     catch (Exception e)
                                     {
-                                        try { logger.Error(e, "Unhandled exception in TraceManager.RunWorkers"); }
+                                        try { logger.Error(e, "Unhandled exception in ReplayConsumer.RunWorkers"); }
                                         catch { Console.WriteLine(e.Message); }
                                     }
                                 }
@@ -137,6 +189,7 @@ namespace WorkloadTools.Consumer.Replay
             {
                 r.Dispose();
             }
+            WorkLimiter.Dispose();
             stopped = true;
         }
 
@@ -158,21 +211,21 @@ namespace WorkloadTools.Consumer.Replay
 
                     foreach (ReplayWorker wrk in ReplayWorkers.Values)
                     {
-                        if (wrk.LastCommandTime < DateTime.Now.AddSeconds(-WORKER_EXPIRY_TIMEOUT_SECONDS) && !wrk.HasCommands)
+                        if (wrk.LastCommandTime < DateTime.Now.AddSeconds(-InactiveWorkerTerminationTimeoutSeconds) && !wrk.HasCommands)
                         {
                             RemoveWorker(wrk.Name);
                         }
                     }
 
-                    logger.Info(String.Format("{0} registered active workers", ReplayWorkers.Count));
-                    logger.Info(String.Format("{0} oldest command date", ReplayWorkers.Min(x => x.Value.LastCommandTime)));
+                    logger.Trace($"{ReplayWorkers.Count} registered active workers");
+                    logger.Trace($"{ReplayWorkers.Min(x => x.Value.LastCommandTime)} oldest command date");
                 }
                 catch (Exception e)
                 {
                     logger.Warn(e.Message);
                 }
 
-                Thread.Sleep(WORKER_EXPIRY_TIMEOUT_SECONDS * 1000); // sleep some seconds
+                Thread.Sleep(InactiveWorkerTerminationTimeoutSeconds * 1000); // sleep some seconds
             }
             logger.Trace("Sweeper thread stopped.");
         }
@@ -183,7 +236,7 @@ namespace WorkloadTools.Consumer.Replay
         {
             ReplayWorker outWrk;
             ReplayWorkers.TryRemove(Int32.Parse(name), out outWrk);
-            logger.Info(String.Format("Worker [{0}] - Disposing", name));
+            logger.Trace($"Worker [{name}] - Disposing");
             outWrk.Stop();
             outWrk.Dispose();
         }
@@ -202,7 +255,6 @@ namespace WorkloadTools.Consumer.Replay
 
                 try
                 {
-                    //Parallel.ForEach(ReplayWorkers.Values, (ReplayWorker wrk) =>
                     foreach (ReplayWorker wrk in ReplayWorkers.Values)
                     {
                         if (stopped) return;
@@ -250,7 +302,7 @@ namespace WorkloadTools.Consumer.Replay
                                     WorkLimiter.Release();
                                 }
                             }
-                            else if (SynchronizationMode == SynchronizationModeEnum.None)
+                            else if (SynchronizationMode == SynchronizationModeEnum.WorkerTask)
                             {
                                 try
                                 {
@@ -261,14 +313,14 @@ namespace WorkloadTools.Consumer.Replay
                                 }
                                 catch (Exception e)
                                 {
-                                    logger.Error(e, "Unhandled exception in ReplayWorker.ExecuteCommand");
+                                    logger.Error(e, "Exception in ReplayWorker.RunWorkers - WorkerTask");
                                 }
                             }
                         }
                     };
 
 
-                    if (SynchronizationMode == SynchronizationModeEnum.None)
+                    if (SynchronizationMode == SynchronizationModeEnum.WorkerTask)
                     {
                         // Sleep 1 second before checking whether more workers
                         // are available and not started
@@ -287,11 +339,15 @@ namespace WorkloadTools.Consumer.Replay
                 {
                     //ignore ...
                 }
+                catch (Exception ex)
+                {
+                    logger.Error(ex, "Exception in ReplayWorker.RunWorkers");
+                }
 
             }
 
 
-            if (SynchronizationMode == SynchronizationModeEnum.None)
+            if (SynchronizationMode == SynchronizationModeEnum.WorkerTask)
             {
                 foreach (ReplayWorker wrk in ReplayWorkers.Values)
                 {
@@ -302,5 +358,9 @@ namespace WorkloadTools.Consumer.Replay
             logger.Trace("Worker thread stopped.");
         }
 
+        public override bool HasMoreEvents()
+        {
+            return ReplayWorkers.Count(t => t.Value.HasCommands) > 0;
+        }
     }
 }
